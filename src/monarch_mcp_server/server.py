@@ -1,21 +1,23 @@
 """Monarch Money MCP Server - Main server implementation."""
 
-import os
-import logging
-import asyncio
-from typing import Any, Dict, List, Optional, Union
-from datetime import datetime, date
 import json
-import threading
-from concurrent.futures import ThreadPoolExecutor
+import logging
+import os
+import re
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from typing import Any, Coroutine, Optional, TypeVar
 
 from dotenv import load_dotenv
-from mcp.server.auth.provider import AccessTokenT
 from mcp.server.fastmcp import FastMCP
-import mcp.types as types
 from monarchmoney import MonarchMoney, RequireMFAException
+from monarchmoney.monarchmoney import MonarchMoneyEndpoints
 from pydantic import BaseModel, Field
 from monarch_mcp_server.secure_session import secure_session
+
+# Fix for Monarch Money API domain change (api.monarchmoney.com -> api.monarch.com)
+# See: https://github.com/hammem/monarchmoney/issues/184
+MonarchMoneyEndpoints.BASE_URL = "https://api.monarch.com"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,11 +29,82 @@ load_dotenv()
 # Initialize FastMCP server
 mcp = FastMCP("Monarch Money MCP Server")
 
+# Constants
+API_TIMEOUT_SECONDS = 30
+MAX_LIMIT = 1000
+MIN_LIMIT = 1
+DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+MAX_DESCRIPTION_LENGTH = 500
 
-def run_async(coro):
-    """Run async function in a new thread with its own event loop."""
+T = TypeVar("T")
 
-    def _run():
+
+class ValidationError(ValueError):
+    """Raised when input validation fails."""
+
+    pass
+
+
+def _sanitize_error(operation: str, error: Exception) -> str:
+    """Return a user-safe error message without exposing internal details."""
+    if isinstance(error, RuntimeError) and "Authentication needed" in str(error):
+        return str(error)
+    if isinstance(error, ValidationError):
+        return f"Validation error: {error}"
+    if isinstance(error, FuturesTimeoutError):
+        return f"Error {operation}: Request timed out. Please try again."
+    return f"Error {operation}: An unexpected error occurred. Check logs for details."
+
+
+def _validate_limit(limit: int) -> int:
+    """Validate and constrain the limit parameter."""
+    if limit < MIN_LIMIT:
+        raise ValidationError(f"limit must be at least {MIN_LIMIT}")
+    if limit > MAX_LIMIT:
+        raise ValidationError(f"limit cannot exceed {MAX_LIMIT}")
+    return limit
+
+
+def _validate_offset(offset: int) -> int:
+    """Validate the offset parameter."""
+    if offset < 0:
+        raise ValidationError("offset must be non-negative")
+    return offset
+
+
+def _validate_date(date_str: Optional[str], field_name: str) -> Optional[str]:
+    """Validate date format (YYYY-MM-DD)."""
+    if date_str is None:
+        return None
+    if not DATE_PATTERN.match(date_str):
+        raise ValidationError(f"{field_name} must be in YYYY-MM-DD format")
+    return date_str
+
+
+def _validate_description(description: str) -> str:
+    """Validate description length."""
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        raise ValidationError(
+            f"description cannot exceed {MAX_DESCRIPTION_LENGTH} characters"
+        )
+    return description
+
+
+def run_async(coro: Coroutine[Any, Any, T], timeout: int = API_TIMEOUT_SECONDS) -> T:
+    """Run async function in a new thread with its own event loop.
+
+    Args:
+        coro: The coroutine to execute.
+        timeout: Maximum seconds to wait for completion (default: API_TIMEOUT_SECONDS).
+
+    Returns:
+        The result of the coroutine.
+
+    Raises:
+        FuturesTimeoutError: If the operation exceeds the timeout.
+    """
+
+    def _run() -> T:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -41,7 +114,7 @@ def run_async(coro):
 
     with ThreadPoolExecutor() as executor:
         future = executor.submit(_run)
-        return future.result()
+        return future.result(timeout=timeout)
 
 
 class MonarchConfig(BaseModel):
@@ -64,10 +137,17 @@ async def get_monarch_client() -> MonarchMoney:
         return client
 
     # If no secure session, try environment credentials
+    # WARNING: Environment variables can leak through process listings (ps aux)
+    # Prefer using login_setup.py for secure keyring-based authentication
     email = os.getenv("MONARCH_EMAIL")
     password = os.getenv("MONARCH_PASSWORD")
 
     if email and password:
+        logger.warning(
+            "⚠️  Using environment variable credentials. This is less secure than "
+            "keyring storage as credentials may be visible in process listings. "
+            "Consider running login_setup.py instead."
+        )
         try:
             client = MonarchMoney()
             await client.login(email, password)
@@ -131,7 +211,8 @@ def check_auth_status() -> str:
 
         return status
     except Exception as e:
-        return f"Error checking auth status: {str(e)}"
+        logger.error(f"Failed to check auth status: {e}", exc_info=True)
+        return _sanitize_error("checking auth status", e)
 
 
 @mcp.tool()
@@ -145,10 +226,9 @@ def debug_session_loading() -> str:
         else:
             return "❌ No token found in keyring. Run login_setup.py to authenticate."
     except Exception as e:
-        import traceback
-
-        error_details = traceback.format_exc()
-        return f"❌ Keyring access failed:\nError: {str(e)}\nType: {type(e)}\nTraceback:\n{error_details}"
+        # Log full details for debugging, but don't expose to user
+        logger.error(f"Keyring access failed: {e}", exc_info=True)
+        return "❌ Keyring access failed. Check logs for details or run login_setup.py to re-authenticate."
 
 
 @mcp.tool()
@@ -156,7 +236,7 @@ def get_accounts() -> str:
     """Get all financial accounts from Monarch Money."""
     try:
 
-        async def _get_accounts():
+        async def _get_accounts() -> dict[str, Any]:
             client = await get_monarch_client()
             return await client.get_accounts()
 
@@ -179,8 +259,8 @@ def get_accounts() -> str:
 
         return json.dumps(account_list, indent=2, default=str)
     except Exception as e:
-        logger.error(f"Failed to get accounts: {e}")
-        return f"Error getting accounts: {str(e)}"
+        logger.error(f"Failed to get accounts: {e}", exc_info=True)
+        return _sanitize_error("getting accounts", e)
 
 
 @mcp.tool()
@@ -195,27 +275,34 @@ def get_transactions(
     Get transactions from Monarch Money.
 
     Args:
-        limit: Number of transactions to retrieve (default: 100)
+        limit: Number of transactions to retrieve (1-1000, default: 100)
         offset: Number of transactions to skip (default: 0)
         start_date: Start date in YYYY-MM-DD format
         end_date: End date in YYYY-MM-DD format
         account_id: Specific account ID to filter by
     """
     try:
+        # Validate inputs
+        validated_limit = _validate_limit(limit)
+        validated_offset = _validate_offset(offset)
+        validated_start = _validate_date(start_date, "start_date")
+        validated_end = _validate_date(end_date, "end_date")
 
-        async def _get_transactions():
+        async def _get_transactions() -> dict[str, Any]:
             client = await get_monarch_client()
 
             # Build filters
-            filters = {}
-            if start_date:
-                filters["start_date"] = start_date
-            if end_date:
-                filters["end_date"] = end_date
+            filters: dict[str, Any] = {}
+            if validated_start:
+                filters["start_date"] = validated_start
+            if validated_end:
+                filters["end_date"] = validated_end
             if account_id:
                 filters["account_id"] = account_id
 
-            return await client.get_transactions(limit=limit, offset=offset, **filters)
+            return await client.get_transactions(
+                limit=validated_limit, offset=validated_offset, **filters
+            )
 
         transactions = run_async(_get_transactions())
 
@@ -240,8 +327,8 @@ def get_transactions(
 
         return json.dumps(transaction_list, indent=2, default=str)
     except Exception as e:
-        logger.error(f"Failed to get transactions: {e}")
-        return f"Error getting transactions: {str(e)}"
+        logger.error(f"Failed to get transactions: {e}", exc_info=True)
+        return _sanitize_error("getting transactions", e)
 
 
 @mcp.tool()
@@ -249,7 +336,7 @@ def get_budgets() -> str:
     """Get budget information from Monarch Money."""
     try:
 
-        async def _get_budgets():
+        async def _get_budgets() -> dict[str, Any]:
             client = await get_monarch_client()
             return await client.get_budgets()
 
@@ -271,8 +358,8 @@ def get_budgets() -> str:
 
         return json.dumps(budget_list, indent=2, default=str)
     except Exception as e:
-        logger.error(f"Failed to get budgets: {e}")
-        return f"Error getting budgets: {str(e)}"
+        logger.error(f"Failed to get budgets: {e}", exc_info=True)
+        return _sanitize_error("getting budgets", e)
 
 
 @mcp.tool()
@@ -287,15 +374,18 @@ def get_cashflow(
         end_date: End date in YYYY-MM-DD format
     """
     try:
+        # Validate inputs
+        validated_start = _validate_date(start_date, "start_date")
+        validated_end = _validate_date(end_date, "end_date")
 
-        async def _get_cashflow():
+        async def _get_cashflow() -> dict[str, Any]:
             client = await get_monarch_client()
 
-            filters = {}
-            if start_date:
-                filters["start_date"] = start_date
-            if end_date:
-                filters["end_date"] = end_date
+            filters: dict[str, Any] = {}
+            if validated_start:
+                filters["start_date"] = validated_start
+            if validated_end:
+                filters["end_date"] = validated_end
 
             return await client.get_cashflow(**filters)
 
@@ -303,8 +393,8 @@ def get_cashflow(
 
         return json.dumps(cashflow, indent=2, default=str)
     except Exception as e:
-        logger.error(f"Failed to get cashflow: {e}")
-        return f"Error getting cashflow: {str(e)}"
+        logger.error(f"Failed to get cashflow: {e}", exc_info=True)
+        return _sanitize_error("getting cashflow", e)
 
 
 @mcp.tool()
@@ -317,7 +407,7 @@ def get_account_holdings(account_id: str) -> str:
     """
     try:
 
-        async def _get_holdings():
+        async def _get_holdings() -> dict[str, Any]:
             client = await get_monarch_client()
             return await client.get_account_holdings(account_id)
 
@@ -325,8 +415,8 @@ def get_account_holdings(account_id: str) -> str:
 
         return json.dumps(holdings, indent=2, default=str)
     except Exception as e:
-        logger.error(f"Failed to get account holdings: {e}")
-        return f"Error getting account holdings: {str(e)}"
+        logger.error(f"Failed to get account holdings: {e}", exc_info=True)
+        return _sanitize_error("getting account holdings", e)
 
 
 @mcp.tool()
@@ -344,21 +434,26 @@ def create_transaction(
     Args:
         account_id: The account ID to add the transaction to
         amount: Transaction amount (positive for income, negative for expenses)
-        description: Transaction description
+        description: Transaction description (max 500 characters)
         date: Transaction date in YYYY-MM-DD format
         category_id: Optional category ID
         merchant_name: Optional merchant name
     """
     try:
+        # Validate inputs
+        validated_date = _validate_date(date, "date")
+        if validated_date is None:
+            raise ValidationError("date is required")
+        validated_description = _validate_description(description)
 
-        async def _create_transaction():
+        async def _create_transaction() -> dict[str, Any]:
             client = await get_monarch_client()
 
-            transaction_data = {
+            transaction_data: dict[str, Any] = {
                 "account_id": account_id,
                 "amount": amount,
-                "description": description,
-                "date": date,
+                "description": validated_description,
+                "date": validated_date,
             }
 
             if category_id:
@@ -372,8 +467,8 @@ def create_transaction(
 
         return json.dumps(result, indent=2, default=str)
     except Exception as e:
-        logger.error(f"Failed to create transaction: {e}")
-        return f"Error creating transaction: {str(e)}"
+        logger.error(f"Failed to create transaction: {e}", exc_info=True)
+        return _sanitize_error("creating transaction", e)
 
 
 @mcp.tool()
@@ -390,25 +485,30 @@ def update_transaction(
     Args:
         transaction_id: The ID of the transaction to update
         amount: New transaction amount
-        description: New transaction description
+        description: New transaction description (max 500 characters)
         category_id: New category ID
         date: New transaction date in YYYY-MM-DD format
     """
     try:
+        # Validate inputs
+        validated_date = _validate_date(date, "date")
+        validated_description = (
+            _validate_description(description) if description is not None else None
+        )
 
-        async def _update_transaction():
+        async def _update_transaction() -> dict[str, Any]:
             client = await get_monarch_client()
 
-            update_data = {"transaction_id": transaction_id}
+            update_data: dict[str, Any] = {"transaction_id": transaction_id}
 
             if amount is not None:
                 update_data["amount"] = amount
-            if description is not None:
-                update_data["description"] = description
+            if validated_description is not None:
+                update_data["description"] = validated_description
             if category_id is not None:
                 update_data["category_id"] = category_id
-            if date is not None:
-                update_data["date"] = date
+            if validated_date is not None:
+                update_data["date"] = validated_date
 
             return await client.update_transaction(**update_data)
 
@@ -416,8 +516,8 @@ def update_transaction(
 
         return json.dumps(result, indent=2, default=str)
     except Exception as e:
-        logger.error(f"Failed to update transaction: {e}")
-        return f"Error updating transaction: {str(e)}"
+        logger.error(f"Failed to update transaction: {e}", exc_info=True)
+        return _sanitize_error("updating transaction", e)
 
 
 @mcp.tool()
@@ -425,7 +525,7 @@ def refresh_accounts() -> str:
     """Request account data refresh from financial institutions."""
     try:
 
-        async def _refresh_accounts():
+        async def _refresh_accounts() -> dict[str, Any]:
             client = await get_monarch_client()
             return await client.request_accounts_refresh()
 
@@ -433,8 +533,8 @@ def refresh_accounts() -> str:
 
         return json.dumps(result, indent=2, default=str)
     except Exception as e:
-        logger.error(f"Failed to refresh accounts: {e}")
-        return f"Error refreshing accounts: {str(e)}"
+        logger.error(f"Failed to refresh accounts: {e}", exc_info=True)
+        return _sanitize_error("refreshing accounts", e)
 
 
 def main():
